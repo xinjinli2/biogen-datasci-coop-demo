@@ -1,0 +1,1256 @@
+---
+title: "| Ring Physio Processing Report\n"
+date: "Last compiled on `r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    df_print: paged
+    toc: true
+    toc_depth: 2
+    toc_float: true
+    code_folding: hide
+  pdf_document:
+    toc: true
+    toc_depth: '2'
+subtitle: Physiological Data Preprocessing
+params:
+  RID: 4186
+---
+
+# RID: `r params$RID`
+
+
+```{r Basic R Settings, echo = FALSE, warning=FALSE, message=FALSE, results='hide'}
+rm(list=ls()[! ls() %in% c("paths_list","params","R_list","r")])
+invisible(gc())
+# Install and load packages
+if(!("pacman" %in% installed.packages()[,"Package"])) install.packages("pacman")
+library(pacman)
+
+p_load(devtools)
+
+
+p_load(
+  tidyverse,
+  data.table,
+  reticulate,
+  DT,
+  kable,
+  kableExtra,
+  rmarkdown,
+  berryFunctions,
+  jsonlite,GA
+)
+
+# Paths
+  #Create a file called 'PathKeeper.R' and place your paths in this file
+  #paths: See bitbucket repository for template. 
+  #Be sure to add PathKeeper.R to your gitignore
+
+
+source("PathKeeper.R")
+pathpattern<-grep(".path$",names(.GlobalEnv),value=TRUE)
+paths_list<-do.call("list",mget(pathpattern))
+
+#Clean Up Environment
+rm(list=grep(".path$|pathpattern", ls(), value=TRUE))
+
+
+# Python must be installed. Check if Python is installed and where.
+if (R.Version()$os == "mingw32") {
+  system("where python") # for Windows
+} else {
+  system("whereis python")
+}
+
+
+# Build in this if condition to not accidentally overwrite the environment when rerunning the notebook
+if (!reticulate::virtualenv_exists(envname = "./python-preprocessing-env/")) {
+  reticulate::virtualenv_create("./python-preprocessing-env/", python = paths_list$python_path)
+}
+#Double checks to see that the virtual environment exists
+reticulate::virtualenv_exists(envname = "/python-preprocessing-env/")
+
+#Not always necessary, but this will explicitly specify R to use the version of Python in the Virtual Environment created.
+if (R.Version()$os == "mingw32") {
+  #Windows path
+  python_path <- file.path(getwd(), "./python-preprocessing-env/Scripts/python.exe")
+} else {
+  #Non-windows Path
+  python_path <- file.path(getwd(), "./python-preprocessing-env/bin/python")
+}
+
+#Checks to see that virtual environment python path exists
+file.exists(python_path)
+#Saves that version of python as being the default for this project.
+Sys.setenv(RETICULATE_PYTHON = python_path)
+
+# make this persist restarts of RStudio by saving the environment variable into an `.Renviron` file (otherwise the `Sys.setenv()` line above needs to be in every script):
+# open the .Renviron file
+usethis::edit_r_environ(scope = "project")
+# or directly append it with the necessary line
+readr::write_lines(
+  x = paste0("RETICULATE_PYTHON=", python_path),
+  file = ".Renviron",
+  append = TRUE
+)
+
+library(reticulate)
+py_config()
+
+# Install Python packages
+reticulate::py_install(
+  c(
+    "pip",
+    "pandas",
+    "numpy",
+    "requests",
+    "session-info",
+    "plotly",
+    "bottleneck",
+    "avro"
+    
+ )
+)
+
+reticulate::py_install(
+  c(
+    "matplotlib",
+    "cvxopt",
+    "neurokit2"
+ ), pip = paths_list$pip_use_path
+)
+
+py$IN_RMD <- TRUE
+# Manually set RID
+RID <-  params$RID
+```
+
+```{python Basic Python Settings, echo = FALSE, warning=FALSE, message=FALSE, results='hide'}
+# import requests
+import numpy as np
+import pandas as pd
+import neurokit2 as nk
+import gc
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+import session_info
+import scipy
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import cvxopt
+import plotly
+from contextlib import contextmanager
+import sys, os
+from EmpaticaExporter import empatica_to_csv
+import PathKeeper
+
+@contextmanager
+def suppress_stdout():
+    with open(os.devnull, "w") as devnull:
+        old_stdout = sys.stdout
+        sys.stdout = devnull
+        try:  
+            yield
+        finally:
+            sys.stdout = old_stdout
+
+plt.close("all")
+
+with suppress_stdout():
+  gc.collect()
+
+```
+
+```{python python parameters settings, echo = TRUE, warning=FALSE, message=FALSE, results='hide'}
+# ECG 400Hz, PPG 400Hz, EDA 20Hz, Temperature 20Hz, Accelerometer 50Hz for ring data
+ecg_sampling_rate = 400
+ppg_sampling_rate = 400
+eda_sampling_rate = 20
+temp_sampling_rate = 20
+acc_sampling_rate = 50
+```
+
+```{r Unzip folder for ring data only, echo = FALSE, warning=FALSE, message=FALSE, results='hide'}
+ring.zip.files <-
+  file.info(list.files(
+    paths_list$zip_file_path,
+    pattern = paste0(RID,"-ring"),
+    full.names = T
+  ))
+
+ring.zip.files <- filter(ring.zip.files, grepl(".zip$", row.names(ring.zip.files)))
+
+for(ring_file in row.names(ring.zip.files)){
+  unzip(ring_file, exdir = paste0(paths_list$zip_file_path,"unzip/ring/"))
+}
+
+new.ring.zip.files <-
+  file.info(file.path(paths_list$zip_file_path, "unzip/ring/"))
+```
+
+```{r check ring zip files path, echo = FALSE, warning=FALSE, message=FALSE, results='hide'}
+print(ring.zip.files)
+print(new.ring.zip.files)
+```
+
+
+```{r Load Merge Ring data (with eventMarkers) for Current Participant, echo = FALSE, warning=FALSE, message=FALSE}
+base_path <- row.names(new.ring.zip.files)
+senstream_path <- paste0(base_path, "/signalFiles/Senstream #21282")
+
+# print("Loading ring data from Senstream directory...")
+
+# get ecg, ppg, eda raw csv files
+ring.csv.files <- list.files(senstream_path, 
+                            pattern = "ecgRaw\\.csv|edaRaw\\.csv|ppgRaw\\.csv", 
+                            full.names = TRUE)
+
+# print("Found ring CSV files")
+# print(ring.csv.files)
+
+
+current_ring <- data.frame(unix_timestamp = numeric(0))
+# current_round <- 0
+
+# safe merge all three signals into `physio_df`
+
+for(csv_file in ring.csv.files) {
+  current_file <- csv_file
+  # print(paste("current_processing:", basename(current_file)))
+  
+  signal <- read_csv(current_file, show_col_types = FALSE)
+  
+  if(grepl("ecgRaw", current_file, ignore.case = TRUE)) {
+    # rename columns to standard format, process ecg data
+    if(ncol(signal) >= 2) {
+      signal <- signal %>% 
+        rename(unix_timestamp = 1, ecg = 2) %>%
+        select(unix_timestamp, ecg)
+    }
+  } else if(grepl("ppgRaw", current_file, ignore.case = TRUE)) {
+    if(ncol(signal) >= 2) {
+      signal <- signal %>% 
+        rename(unix_timestamp = 1, bvp = 2) %>%  # Renamed ppg → bvp
+        select(unix_timestamp, bvp)
+    }
+  } else if(grepl("edaRaw", current_file, ignore.case = TRUE)) {
+    if(ncol(signal) >= 2) {
+      signal <- signal %>% 
+        rename(unix_timestamp = 1, eda = 2) %>%
+        select(unix_timestamp, eda)
+    }
+  }
+  
+  if(nrow(current_ring) == 0) {
+    current_ring <- signal
+  } else {
+    current_ring <- current_ring %>% full_join(signal, by = "unix_timestamp")
+  }
+  
+  # print(paste("Current ring dataframe dimensions:", nrow(current_ring), "x", ncol(current_ring)))
+  # print("---")
+}
+
+
+physio_df <- current_ring %>% 
+  filter(!is.na(unix_timestamp)) %>%
+  arrange(unix_timestamp)
+
+
+ride_timing <- read_csv("/Users/xinjinli/Desktop/pre_process/1_Pre-process/rideLengthFix_correct.csv") %>%
+  filter(RID == params$RID)
+
+session_start_est <- ride_timing$session_start_est[1]
+
+abs_time_est <- c(
+  ride_timing$Baseline_Start,
+  ride_timing$Ride1_Start - seconds(1),  # Baseline end = 1 second before Ride1_Start
+  ride_timing$Ride1_Start,
+  ride_timing$Ride1_End,
+  ride_timing$Ride2_Start,
+  ride_timing$Ride2_End)
+
+session_start_time <- as.numeric(lubridate::ymd_hms(ride_timing$session_start_utc)) * 1e6
+
+events <- tibble(
+  event = 1:6,
+  event_label = c("Baseline_Start", "Baseline_End", "Ride1_Start", "Ride1_End", "Ride2_Start", "Ride2_End"),
+  abs_time_est = abs_time_est,
+  # Fix: Use consistent microsecond conversion
+  rel_time_usec = as.numeric(difftime(abs_time_est, session_start_est, units = "secs")) * 1e6,
+  unix_timestamp = session_start_time + rel_time_usec
+)
+
+events
+
+rm(list = c("watch.csv.files", "watch.zip.files", "current_watch","signal"))
+invisible(gc())
+
+# raw2<-py$raw
+```
+
+```{r join event and physio_df, echo = FALSE, warning=FALSE, message=FALSE}
+find_closest_match_ring <- function(physio_df, events_df, tolerance_seconds = 30) {
+  
+  physio_session_start <- min(physio_df$unix_timestamp, na.rm = TRUE)
+  
+  physio_with_relative <- physio_df %>%
+    mutate(
+      rel_time_usec = unix_timestamp - physio_session_start,
+      rel_time_sec = rel_time_usec / 1e6
+    )
+  
+  events_with_relative <- events_df %>%
+    mutate(
+      rel_time_sec = rel_time_usec / 1e6
+    )
+  
+  event_matches <- map_dfr(1:nrow(events_with_relative), function(i) {
+    event_rel_time <- events_with_relative$rel_time_sec[i]
+    event_id <- events_with_relative$event[i]
+    event_code <- events_with_relative$Code[i]
+    start_or_stop <- events_with_relative$Start_or_Stop[i]
+   
+    time_diffs_sec <- abs(physio_with_relative$rel_time_sec - event_rel_time)
+    min_diff_sec <- min(time_diffs_sec, na.rm = TRUE)
+    
+    if (min_diff_sec <= tolerance_seconds) {
+      closest_physio_idx <- which.min(time_diffs_sec)
+      tibble(
+        event = event_id,
+        physio_row = closest_physio_idx,
+        time_diff_sec = min_diff_sec,
+        event_rel_time = event_rel_time,
+        physio_rel_time = physio_with_relative$rel_time_sec[closest_physio_idx],
+        Code = event_code,
+        Start_or_Stop = start_or_stop
+      )
+    } else {
+      tibble(
+        event = event_id,
+        physio_row = NA_integer_,
+        time_diff_sec = NA_real_,
+        event_rel_time = event_rel_time,
+        physio_rel_time = NA_real_,
+        Code = event_code,
+        Start_or_Stop = start_or_stop
+      )
+    }
+  })
+
+  event_matches_clean <- event_matches %>%
+    filter(!is.na(physio_row)) %>%
+    group_by(event) %>%
+    slice_min(order_by = time_diff_sec, n = 1, with_ties = FALSE) %>%
+    ungroup()
+  
+  result <- physio_with_relative %>%
+    mutate(physio_row = row_number()) %>%
+    left_join(
+      event_matches_clean %>% 
+        select(physio_row, event, time_diff_sec, Code, Start_or_Stop), by = "physio_row"
+    ) %>%
+    select(-physio_row, -rel_time_sec) %>%  
+    mutate(
+      Time_microsec = as.double(unix_timestamp),
+      event_binary = case_when(
+        Start_or_Stop == "START" ~ 1,
+        Start_or_Stop == "STOP" ~ 0,
+        TRUE ~ 0
+      ),
+      event_original = event,
+      event = as.integer(coalesce(event, 0))  
+    )
+  
+  return(result)
+}
+```
+
+
+```{r Load Event_enhanced, echo=FALSE, message=FALSE, warning=FALSE}
+# Extract Event Marks from Ring
+
+# Load Codebook Data
+Codebook <-
+  read.csv(file = paths_list$codebook_path, header = TRUE) # 6 obs of 4 variables
+ 
+#Check the Codebook for specific Codes 
+shortList <- Codebook %>% select(-Binary.Number) %>%
+      mutate(Code =case_when(Code == "End Study (Old)" ~ "Program Start/End",
+         TRUE ~ Code)) %>%
+filter(!Code %in% c("Welcome Slide", "Instruction Slide 1",
+                   "Breathing Instructions 1","Negative Stimulus Block Instructions",
+                   "Control Stimulus Block Instructions",
+                  "Qustion Block Instructions",
+                 "Breathing Instructions 2", 
+                 "Stroop Block Instructions"
+                 ) &
+  !is.na(Decimal.Number)) %>%
+  mutate(Decimal.Number = case_when(Decimal.Number == 255 ~0,
+                                    Decimal.Number == 1~ Decimal.Number,
+                                    Decimal.Number > 1 ~ Decimal.Number+1,
+                                    TRUE ~ NA_integer_),
+         )%>%
+  add_row(Decimal.Number = 2,  Code = "Baseline END") %>% arrange(Decimal.Number) %>%
+  mutate(Decimal.Number = ifelse(Decimal.Number == 0, 255, Decimal.Number))
+
+# Load Journal Data
+Journal <- events %>%
+  filter(!is.na(unix_timestamp) & !is.na(event)) %>%
+  mutate(unix_timestamp = as.double(unix_timestamp))
+
+# Create "short" Journal w. key segments of interest  
+Journal_short <-
+  events %>% inner_join(shortList, by=c("event" = "Decimal.Number")) %>%
+  mutate(Time_microsec = ceiling(unix_timestamp),
+         Start_or_Stop = case_when(
+           Code == "Baseline END" & is.na(Start_or_Stop) ~ "STOP",
+           TRUE ~ Start_or_Stop
+         ))
+
+# this gives Journal short with clear timestamp of all 6 event markers. 
+
+TTL_of_Interest <- Journal_short %>% select(event) %>% pull() # 1 2 3 4 5 6
+
+
+events_enhanced <- events %>%
+  filter(!is.na(unix_timestamp) & !is.na(event)) %>%
+  left_join(shortList, by = c("event" = "Decimal.Number")) %>%
+  mutate(
+    Time_microsec = as.numeric(round(unix_timestamp)),  # keep microsec scale cleanly
+    Start_or_Stop = case_when(
+      Code == "Baseline END" & is.na(Start_or_Stop) ~ "STOP",
+      TRUE ~ Start_or_Stop
+    )
+  ) %>%
+  filter(!is.na(Code)) %>%
+  arrange(Time_microsec)   # <— important
+
+
+events_enhanced
+```
+
+```{r Load Physio, echo=FALSE, message=FALSE, warning=FALSE}
+# now we can do direct join for ALL events since event 2 has a real timestamp
+# physio_df <- physio_df %>% 
+#   full_join(events_enhanced, by = "unix_timestamp") %>% 
+#   arrange(unix_timestamp)
+
+# physio_journal_short_df <- physio_df %>%
+#   mutate(unix_timestamp = as.double(unix_timestamp)) %>%
+#   rename("Time_microsec" = "unix_timestamp") %>%
+#   full_join(events_enhanced, by = c("Time_microsec")) %>%
+#   # Create event column based on proximity-matched journal data
+#   mutate(event = case_when(
+#     Start_or_Stop == "START" ~ 1,
+#     Start_or_Stop == "STOP" ~ 0,
+#     TRUE ~ 0  # Default to 0 if no journal match found
+#   )) %>%
+#   mutate(event = as.integer(event))
+
+# Set reasonable tolerance (e.g., 1 second = 1e6 microseconds)
+tolerance_usec <- 1e6  # 1 second tolerance
+
+# Apply the proximity matching
+physio_df_ecg <- physio_df %>% 
+  filter(!is.na(ecg)) %>% select(unix_timestamp, ecg)
+
+physio_df_bvp <- physio_df %>% 
+  filter(!is.na(bvp)) %>% select(unix_timestamp, bvp)
+
+physio_df_eda <- physio_df %>% 
+  filter(!is.na(eda)) %>% select(unix_timestamp, eda)
+
+physio_journal_short_ecg <- find_closest_match_ring(physio_df_ecg, events_enhanced,
+                                                    tolerance_usec)
+
+physio_journal_short_bvp <- find_closest_match_ring(physio_df_bvp, events_enhanced,
+                                                    tolerance_usec)
+
+physio_journal_short_eda <- find_closest_match_ring(physio_df_eda, events_enhanced, 
+                                                    1e5)
+```
+
+```{r}
+physio_journal_short_df_bvp = physio_journal_short_bvp %>% 
+  rownames_to_column('rn') %>% 
+  column_to_rownames('rn')
+physio_journal_short_df_eda = physio_journal_short_eda %>% 
+  rownames_to_column('rn') %>% 
+  column_to_rownames('rn')
+physio_journal_short_df_ecg = physio_journal_short_ecg %>% 
+  rownames_to_column('rn') %>% 
+  column_to_rownames('rn')
+
+
+# Create Condition List for use in NeuroKit2 in Python
+condition_list_ecg <- 
+  physio_journal_short_df_ecg %>% filter(!is.na(Code) & 
+                                       Start_or_Stop !="STOP") %>% distinct(Code) %>% select(Code) %>% pull()
+
+condition_list_bvp <-
+  physio_journal_short_df_bvp %>% filter(!is.na(Code) & 
+                                       Start_or_Stop !="STOP") %>% distinct(Code) %>% select(Code) %>% pull()
+
+condition_list_eda <-
+  physio_journal_short_df_eda %>% filter(!is.na(Code) &
+                                       Start_or_Stop !="STOP") %>% distinct(Code) %>% select(Code) %>% pull()
+
+
+physio_df_period_duration <- events_enhanced %>%
+  arrange(event) %>%
+  mutate(group = ceiling(event / 2)) %>%
+  group_by(group) %>%
+  summarise(duration_sec = diff(unix_timestamp) / 1e6, .groups = "drop") %>%
+  pull(duration_sec)
+
+print(physio_df_period_duration)
+
+# condition_list_eda <-
+#   physio_journal_short_df_eda %>% filter(!is.na(Code)) %>% distinct(Code) %>% select(Code) %>% pull()
+
+# rm(list = c("Journal", "Journal_short", "Codebook", "journal.files", "physio_df", "physio.files", "shortList", "cutpoint_start", "cutpoint_end"))
+# invisible(gc())
+
+```
+
+# About this Report
+
+> RID : `r params$RID`  
+  
+> Generation Date: `r format(Sys.time(), '%d %B, %Y')`  
+
+This is a processing report for Respondent ID (RID) `r params$RID` from the **Inter-university Consortium for Political and Social Research (ICPSR)  An Introduction to Psychophysiology Measurement and Metrics Workshop** It contains visualizations and summaries regarding the ECG (electrocardiogram) and EDA (electrodermal activity) data collected from this specific participant during a session of the example Experiment programed in PsychoPy.
+
+Data are being processed and summarized using a Python package called NeuroKit2. Refer the the NeuroKit website for documentation on all of the processes and metrics. [NeuroKit2 Website](https://neuropsychology.github.io/NeuroKit/introduction.html)
+
+Data are summarized over specific segments (durations) of the stimulus-presentation program from PsychoPy ( Open Science Tools Ltd.):
+
+
+
+# Raw Signal Overview
+
+The plot below is a visualization of all physiological data recorded for this participant. EDA is in microSiemens, ECG is in Volts, and the final plot is simply a representation of events of the specific divisions of data that will be used in analysis. The X-axis was in Samples. The sampling rate was 1000Hz.
+
+```{python Transfer Data From R, echo = FALSE, warning=FALSE, message=FALSE}
+
+ecg_df = pd.DataFrame({
+    "Time_microsec": r.physio_journal_short_df_ecg["Time_microsec"],
+    "ECG": r.physio_journal_short_df_ecg["ecg"],
+    "Event": r.physio_journal_short_df_ecg["event_binary"]  
+}).dropna(subset=["ECG"])
+
+eda_df = pd.DataFrame({
+    "Time_microsec": r.physio_journal_short_df_eda["Time_microsec"],
+    "EDA": r.physio_journal_short_df_eda["eda"],
+    "Event": r.physio_journal_short_df_eda["event_binary"]  
+}).dropna(subset=["EDA"])
+
+ppg_df = pd.DataFrame({
+    "Time_microsec": r.physio_journal_short_df_bvp["Time_microsec"],
+    "PPG": r.physio_journal_short_df_bvp["bvp"],
+    "Event": r.physio_journal_short_df_bvp["event_binary"]  
+}).dropna(subset=["PPG"])
+
+
+event_df_ecg = ecg_df[["Time_microsec", "Event"]].copy()
+event_df_eda = eda_df[["Time_microsec", "Event"]].copy()
+event_df_ppg = ppg_df[["Time_microsec", "Event"]].copy()
+
+                
+```
+
+
+```{r Cleanup Memory, echo = FALSE, warning=FALSE, message=FALSE}
+invisible(gc())
+```
+
+
+
+```{python raw Data plot, echo = FALSE, warning=FALSE, message=FALSE}
+resample_rate = 500
+
+# downsampling ecg, eda, and ppg for raw plot purpose
+data_downsampled_ECG = nk.signal_resample(ecg_df["ECG"], sampling_rate = ecg_sampling_rate, desired_sampling_rate = resample_rate) # 500 just for plotting
+data_downsampled_EDA = nk.signal_resample(eda_df["EDA"], sampling_rate = eda_sampling_rate, desired_sampling_rate = resample_rate)
+data_downsampled_PPG = nk.signal_resample(ppg_df["PPG"], sampling_rate = ppg_sampling_rate, desired_sampling_rate = resample_rate)
+# downsampling event data for raw plot purpose
+data_downsampled_Event_ecg = nk.signal_resample(event_df_ecg["Event"], sampling_rate = ecg_sampling_rate, desired_sampling_rate = resample_rate)
+data_downsampled_Event_eda = nk.signal_resample(event_df_eda["Event"], sampling_rate = eda_sampling_rate, desired_sampling_rate = resample_rate)
+data_downsampled_Event_ppg = nk.signal_resample(event_df_ppg["Event"], sampling_rate = ppg_sampling_rate, desired_sampling_rate = resample_rate)
+
+
+# convert them to dataframe
+df_downsampled_ECG = pd.DataFrame(data_downsampled_ECG, columns = ['ECG'])
+df_downsampled_EDA = pd.DataFrame(data_downsampled_EDA, columns = ['EDA'])
+df_downsampled_PPG = pd.DataFrame(data_downsampled_PPG, columns = ['PPG'])
+
+df_downsampled_Event_ecg = pd.DataFrame(data_downsampled_Event_ecg, columns = ['Event'])
+df_downsampled_Event_eda = pd.DataFrame(data_downsampled_Event_eda, columns = ['Event'])
+df_downsampled_Event_ppg = pd.DataFrame(data_downsampled_Event_ppg, columns = ['Event']) 
+
+
+data_downsampled_ecg = pd.concat([df_downsampled_ECG, df_downsampled_Event_ecg], axis = 1)
+data_downsampled_eda = pd.concat([df_downsampled_EDA, df_downsampled_Event_eda], axis = 1)
+data_downsampled_ppg = pd.concat([df_downsampled_PPG, df_downsampled_Event_ppg], axis = 1)
+
+
+del data_downsampled_ECG
+del data_downsampled_EDA
+del data_downsampled_PPG
+del data_downsampled_Event_ppg
+del data_downsampled_Event_eda
+del data_downsampled_Event_ecg
+
+del df_downsampled_ECG
+del df_downsampled_EDA
+del df_downsampled_PPG
+del df_downsampled_Event_ecg
+del df_downsampled_Event_eda
+del df_downsampled_Event_ppg
+
+with suppress_stdout():
+  gc.collect()
+  
+nk.signal_plot(data_downsampled_ecg[[ "ECG", "Event"]], subplots=True)
+plt.title("Downsampled ECG and Events")
+plt.show()
+plt.close()
+
+nk.signal_plot(data_downsampled_eda[[ "EDA", "Event"]], subplots=True)
+plt.title("Downsampled EDA and Events")
+plt.show()
+plt.close()
+
+nk.signal_plot(data_downsampled_ppg[[ "PPG", "Event"]], subplots=True)
+plt.title("Downsampled PPG and Events")
+plt.show()
+plt.close()
+
+with suppress_stdout():
+  gc.collect()
+```
+
+# Processed Signal Overview by Segment
+
+Data are summarized over specific segments (durations) of the stimulus-presentation program from PsychoPy (Open Science Tools Ltd.):
+
+`r knitr::kable(
+  data.frame(
+    Segment = condition_list_eda,
+    Duration_sec = physio_df_period_duration
+  ),
+  col.names = c("Segment", "Duration (sec)")
+) %>% kable_styling("striped")`
+
+
+Below is a plot where all segments are located, in order of occurrence in the list above.
+
+```{python}
+nk.events_find(data_downsampled_ecg["Event"], threshold_keep='above', event_conditions=r.condition_list_ecg)
+```
+
+
+```{python Events Plot, echo = FALSE, warning=TRUE, message=FALSE}
+# ecg plot
+events = nk.events_find(data_downsampled_ecg["Event"], threshold_keep='above', event_conditions=r.condition_list_ecg)
+nk.events_plot(events, data_downsampled_ecg)
+plt.title("ECG by Events (baseline, ride1, ride2)")
+plt.show()
+plt.close()
+
+# eda plot
+events = nk.events_find(data_downsampled_eda["Event"], threshold_keep='above', event_conditions=r.condition_list_eda)
+nk.events_plot(events, data_downsampled_eda)
+plt.title("EDA by Events (baseline, ride1, ride2)")
+plt.show()
+plt.close()
+
+# ppg plot
+events = nk.events_find(data_downsampled_ppg["Event"], threshold_keep='above', event_conditions=r.condition_list_bvp)
+nk.events_plot(events,data_downsampled_ppg)
+plt.title("PPG(BVP) by Events (baseline, ride1, ride2)")
+plt.show()
+plt.close()
+
+
+with suppress_stdout():
+  gc.collect()
+```
+
+
+
+Next, electrocardiogram (ECG) and electrodermal activity (EDA) data are processed, plotted, and summarized for each segment.
+
+## Electrodermal Activity Overview
+
+```{python EDA Epoch Creation, echo=FALSE, message=FALSE, warning=FALSE, results='hide'}
+eda_events = nk.events_find(eda_df["Event"], threshold_keep='above', event_conditions = r.condition_list_eda)
+eda_epochs_raw = nk.epochs_create(eda_df,
+                                  eda_events,
+                                  sampling_rate = eda_sampling_rate,
+                                  epochs_start = 0,
+                                  epochs_end = r.physio_df_period_duration)
+```
+
+Below are plots and a table summarizing electrodermal activity across each individual segment of the experiment.
+
+
+```{python EDA Processing by Epoch, echo = FALSE, warning=FALSE, message=FALSE}
+final_eda_signals = {}
+final_eda_info = {}
+EDA_Interval_Table = pd.DataFrame() 
+
+sampling_rate = eda_sampling_rate # June24, this is the sampling rate for EDA
+
+for i in eda_epochs_raw:
+  #print(i)
+  
+  signal = eda_epochs_raw[i]
+  
+  # print(f"\n--- Epoch {i} ---")
+  # print(f"  Shape of signal: {signal.shape}")
+  # print(f"  Length of EDA column: {len(signal['EDA'])}")
+
+  eda_signal = signal["EDA"]
+  
+  # Sanitize input
+  eda_signal = nk.signal_sanitize(eda_signal) # Reset indexing for Pandas Series.
+  sampling_rate = eda_sampling_rate
+  # Preprocess
+  # Clean signal
+  eda_cleaned = nk.eda_clean(
+    eda_signal,
+    sampling_rate = sampling_rate,
+    # method="biosppy" # More aggresive filtering than NeuroKit's default method
+    method = "neurokit"
+  )
+
+  eda_decomposed = nk.eda_phasic(
+    eda_cleaned,
+    sampling_rate = sampling_rate,
+    method="cvxEDA" # this may need to be changed
+    # method = "highpass"
+    # method = "smoothmedian"
+  )
+  
+  # Find peaks
+  peak_signal, info = nk.eda_peaks(
+    eda_decomposed["EDA_Phasic"].values,
+    sampling_rate = sampling_rate,
+    # method="kim2004",
+    method = "nabian2018",
+    amplitude_min=0.1
+  )
+
+  # for method in ["kim2004", "neurokit", "nabian2018"]:
+  #   peaks, info = nk.eda_peaks(eda_decomposed["EDA_Phasic"], sampling_rate=20, method=method)
+  #   print(f"{method} found {len(info['SCR_Peaks'])} peaks.")
+
+    
+  info["sampling_rate"] = sampling_rate 
+
+    # Store
+  signals = pd.DataFrame({"EDA_Raw": eda_signal, "EDA_Clean": eda_cleaned})
+  signals = pd.concat([signals, eda_decomposed, peak_signal], axis=1)
+  
+  # signals["Time_microsec"] = time_microsec[:len(signals) 
+
+  final_eda_signals[i] = signals
+  final_eda_info[i] = info
+  
+  Next_EDA_Interval_Table = nk.eda_intervalrelated(signals, sampling_rate = sampling_rate)
+
+  EDA_Interval_Table = pd.concat([EDA_Interval_Table, Next_EDA_Interval_Table], ignore_index=True, axis=0)
+  
+  nk.eda_plot(signals, info,static=True)
+  plt.suptitle(eda_epochs_raw[i]['Condition'][0])
+  plt.show()
+
+condition_list = pd.DataFrame(r.condition_list_eda, columns = ['Section'])
+EDA_Interval_Table = pd.concat([condition_list, EDA_Interval_Table], axis=1)
+
+# new
+eda_time_list = [
+    eda_epochs_raw[i]["Time_microsec"].iloc[:len(final_eda_signals[i])]  # safe alignment
+    for i in eda_epochs_raw
+]
+eda_time_concat = pd.concat(eda_time_list, ignore_index=True)
+# print("Concatenated time length:", len(eda_time_concat)) # new
+
+lst = list(final_eda_signals.values())
+
+# print("Number of segments in lst:", len(lst))
+# for idx, seg in enumerate(lst):
+#     print(f"  Segment {idx+1}: {len(seg)} rows")
+    
+final_eda_signals_df = pd.concat(lst)  
+# print("Final concatenated final_eda_signals_df:", final_eda_signals_df.shape)
+
+# new
+final_eda_signals_df["Time_microsec"] = eda_time_concat.values  # aligned
+final_eda_signals_df["Time_sec"] = final_eda_signals_df["Time_microsec"] / 1e6 # new
+
+# del(lst)
+# try different methods, see which one works the best
+```
+
+Below are a series of metrics for EDA, broken down by segments of the Protocol.
+
+```{r EDA Metrics Table, echo = FALSE, warning=FALSE, message=FALSE, rows.print=15}
+eda_metrics <-   py$EDA_Interval_Table %>% mutate(ID = row_number()) %>% select(ID, everything())
+# eda_metrics$Section[3] <- "Ride 2 START" # EDA_Tonic_Mean 
+paged_table(eda_metrics, options=list(rows.print=15)) # decide if the values are legitimate, -0.0004065757	 cannot be negative
+``` 
+
+
+## Electrocardiogram Overview
+
+```{python ECG Epoch Creation, echo = FALSE, warning=FALSE, message=FALSE}
+
+                                  
+                     
+ecg_events = nk.events_find(ecg_df["Event"], threshold_keep='above', event_conditions=r.condition_list_ecg)
+ecg_epochs_raw = nk.epochs_create(ecg_df,
+                                  ecg_events,
+                                  sampling_rate = ecg_sampling_rate,
+                                  epochs_start = 0,
+                                  epochs_end = r.physio_df_period_duration)
+```
+
+Below are plots and a table summarizing the electrocardiogram across each individual segment of the experiment.
+
+```{python ECG Processing by Epoch, echo = FALSE, warning=FALSE, message=FALSE,eval=TRUE}
+final_ecg_signals = {}
+final_ecg_info = {}
+ECG_Interval_Table = pd.DataFrame()
+
+for i in ecg_epochs_raw:
+
+  signal = ecg_epochs_raw[i]
+  ecg_signal = signal["ECG"]
+
+  # Do processing
+  ecg_signal = nk.signal_sanitize(ecg_signal)
+  ecg_cleaned = nk.ecg_clean(ecg_signal, 
+                            method = "biosppy", 
+                            sampling_rate = ecg_sampling_rate)
+                            # powerline=60) #June26 Sampling rate, setting these at the top (Python)
+  instant_peaks, info = nk.ecg_peaks(ecg_cleaned = ecg_cleaned, 
+                                      sampling_rate = ecg_sampling_rate, 
+                                      correct_artifacts=True) # used default method
+  rate = nk.signal_rate(info, sampling_rate = ecg_sampling_rate, desired_length=len(ecg_cleaned))
+  quality = nk.ecg_quality(ecg_cleaned, rpeaks=info["ECG_R_Peaks"], sampling_rate = ecg_sampling_rate) # should not be trusted
+  quality_cat = nk.ecg_quality(ecg_cleaned, rpeaks=info["ECG_R_Peaks"], sampling_rate = ecg_sampling_rate, method="zhao2018", approach="fuzzy")
+
+  # Prepare output
+  signals = pd.DataFrame({"ECG_Raw": ecg_signal,
+                              "ECG_Clean": ecg_cleaned,
+                              "ECG_Rate": rate,
+                              "ECG_Quality": quality,
+                              "ECG_Quality_Cat": quality})
+                         
+                              # Delineate QRS complex
+  delineate_signal, delineate_info = nk.ecg_delineate(
+      ecg_cleaned=ecg_cleaned, rpeaks=info["ECG_R_Peaks"], sampling_rate=ecg_sampling_rate
+  )
+ 
+  info.update(delineate_info)  # Merge waves indices dict with info dict
+
+  # Determine cardiac phases
+  cardiac_phase = nk.ecg_phase(
+      ecg_cleaned=ecg_cleaned,
+      rpeaks=info["ECG_R_Peaks"],
+      delineate_info=delineate_info,
+      sampling_rate=ecg_sampling_rate
+  )
+
+  # Add additional information to signals DataFrame
+  signals = pd.concat(
+      [signals, instant_peaks, delineate_signal], axis=1
+  )
+  
+  
+
+  final_ecg_signals[i] = signals
+  final_ecg_info[i] = info
+  
+  ECG_Rate_Mean = np.mean(signals["ECG_Rate"].values)
+  
+  ECG_Rate_Mean_df = pd.DataFrame([ECG_Rate_Mean], columns=["ECG_Rate_Mean"])
+  
+  hrv_out = []
+  
+  hrv_out.append(nk.hrv_time(peaks=info["ECG_R_Peaks"], sampling_rate=ecg_sampling_rate))
+  hrv_out.append(nk.hrv_frequency(peaks=info["ECG_R_Peaks"], sampling_rate=ecg_sampling_rate))
+  hrv_out = pd.concat(hrv_out, axis=1)
+  
+  Next_ECG_Interval_Table = pd.concat([ECG_Rate_Mean_df,hrv_out],axis=1)
+  
+
+  
+  Next_ECG_Interval_Table["ECG_Quality_Cat"] = signals["ECG_Quality_Cat"].mode()
+  cols = list(Next_ECG_Interval_Table)
+  cols.insert(0, cols.pop(cols.index('ECG_Quality_Cat')))
+  
+  ECG_Quality_Cat = pd.DataFrame.from_dict((signals.ECG_Quality_Cat.value_counts() / len(signals))*100)
+  ECG_Quality_Cat = ECG_Quality_Cat.rename(columns={"count": "percentage"})
+  
+  
+  
+  Next_ECG_Interval_Table = Next_ECG_Interval_Table.loc[:, cols]
+  
+  
+  Next_ECG_Interval_Table["ECG_Quality"] = signals["ECG_Quality"].mean()
+  cols = list(Next_ECG_Interval_Table)
+  cols.insert(0, cols.pop(cols.index('ECG_Quality')))
+  Next_ECG_Interval_Table = Next_ECG_Interval_Table.loc[:, cols]
+
+  ECG_Interval_Table = pd.concat([ECG_Interval_Table, Next_ECG_Interval_Table], ignore_index=True, axis=0)
+  
+  nk.ecg_plot(signals, info)
+  plt.suptitle(ecg_epochs_raw[i]['Condition'][0])
+  plt.show()
+  plt.close()
+
+
+condition_list = pd.DataFrame(r.condition_list_ecg, columns =['Section'])
+ECG_Interval_Table = pd.concat([condition_list, ECG_Interval_Table], axis=1)
+
+# align the timestamp with the final_ecg_signals: extracting timestamp
+ecg_time_list = [
+    ecg_epochs_raw[i]["Time_microsec"].iloc[:len(final_ecg_signals[i])]  # safe alignment
+    for i in ecg_epochs_raw
+]
+ecg_time_concat = pd.concat(ecg_time_list, ignore_index=True)
+
+
+lst = list(final_ecg_signals.values())
+final_ecg_signals_df = pd.concat(lst)  
+
+# align the timestamp
+final_ecg_signals_df["Time_microsec"] = ecg_time_concat.values  # aligned
+final_ecg_signals_df["Time_sec"] = final_ecg_signals_df["Time_microsec"] / 1e6 # new
+
+del(hrv_out)
+del(ECG_Rate_Mean_df)
+del(ECG_Rate_Mean)
+
+with suppress_stdout():
+  gc.collect()
+```
+
+Below are a series of metrics for elements of the particpant's heart rate, broken down by segments of the Protocol.
+
+```{r ECG Metrics Table, echo = FALSE, warning=FALSE, message=FALSE,rows.print=15, eval=TRUE}
+ecg_metrics <-   py$ECG_Interval_Table %>% mutate(ID = row_number()) %>% select(ID, everything())
+paged_table(
+  (ecg_metrics %>%
+   mutate(across(contains("HRV"), as.double)) %>% #Converts matrix columns to doubles
+  mutate(ECG_Rate_Mean = as.double(ECG_Rate_Mean))), 
+  options=list(rows.print=15))
+
+```
+
+
+## Photoplethysmogram (PPG) Overview
+
+```{python PPG Epoch Creation, echo = FALSE, warning=FALSE, message=FALSE}
+ppg_events = nk.events_find(ppg_df["Event"], threshold_keep='above', event_conditions=r.condition_list_bvp)
+ppg_epochs_raw = nk.epochs_create(ppg_df, 
+                                  ppg_events,
+                                  sampling_rate = ppg_sampling_rate, 
+                                  epochs_start = 0, 
+                                  epochs_end = r.physio_df_period_duration)
+```
+
+Below are plots and a table summarizing the photoplethysmogram  across each individual segment of the experiment.
+
+```{python PPG Processing by Epoch, echo = FALSE, warning=FALSE, message=FALSE}
+final_ppg_signals = {}
+final_ppg_info = {}
+PPG_Interval_Table   = pd.DataFrame() 
+
+for i in ppg_epochs_raw:
+
+    #print(i)
+    signal = ppg_epochs_raw[i]
+    ppg_signal = signal["PPG"]
+
+  
+    ppg_signal = nk.signal_sanitize(ppg_signal)
+    ppg_cleaned = nk.ppg_clean(ppg_signal, method="elgendi",sampling_rate = ppg_sampling_rate) # fix the sampling rate
+    
+    # peaks_signal, info = nk.ppg_peaks(ppg_cleaned=ppg_cleaned, sampling_rate=64, correct_artifacts=False)
+    peaks_signal, info = nk.ppg_peaks(ppg_cleaned=ppg_cleaned, sampling_rate = ppg_sampling_rate, correct_artifacts = True)
+
+  
+    info["sampling_rate"] = ppg_sampling_rate
+  
+    rate = nk.signal_rate(
+    info["PPG_Peaks"], 
+    sampling_rate=ppg_sampling_rate,
+    desired_length=len(ppg_cleaned))
+    
+    # quality = nk.ppg_quality(ppg_cleaned, ppg_pw_peaks=info["PPG_Peaks"], sampling_rate=ppg_sampling_rate)
+    
+    quality = nk.ppg_quality(
+    ppg_cleaned,
+    peaks=info["PPG_Peaks"],          # <-- rename this kwarg
+    sampling_rate=ppg_sampling_rate)
+  
+  
+    signals = pd.DataFrame(
+      {
+        "PPG_Raw": ppg_signal,
+        "PPG_Clean": ppg_cleaned,
+        "PPG_Rate": rate,
+        "PPG_Quality": quality,
+        "PPG_Peaks": peaks_signal["PPG_Peaks"].values,
+      }
+    )
+  
+  
+    final_ppg_signals[i] = signals
+    final_ppg_info[i] = info
+    PPG_Rate_Mean = np.mean(signals["PPG_Rate"].values)
+    PPG_Rate_Mean_df = pd.DataFrame([PPG_Rate_Mean], columns=["PPG_Rate_Mean"])
+    
+    hrv_out = []
+    hrv_out.append(nk.hrv_time(peaks=info["PPG_Peaks"], sampling_rate=ppg_sampling_rate))
+    hrv_out.append(nk.hrv_frequency(peaks=info["PPG_Peaks"], sampling_rate=ppg_sampling_rate))
+    hrv_out = pd.concat(hrv_out, axis=1)
+    Next_PPG_Interval_Table = pd.concat([PPG_Rate_Mean_df,hrv_out],axis=1)
+    
+    cols = list(Next_PPG_Interval_Table)
+    
+    
+    
+    Next_PPG_Interval_Table = Next_PPG_Interval_Table.loc[:, cols]
+    
+    
+    Next_PPG_Interval_Table["PPG_Quality"] = signals["PPG_Quality"].mean()
+    cols = list(Next_PPG_Interval_Table)
+    cols.insert(0, cols.pop(cols.index('PPG_Quality')))
+    Next_PPG_Interval_Table = Next_PPG_Interval_Table.loc[:, cols]
+  
+    PPG_Interval_Table = pd.concat([PPG_Interval_Table, Next_PPG_Interval_Table], ignore_index=True, axis=0)
+  
+    nk.ppg_plot(signals, info)
+    plt.suptitle(ppg_epochs_raw[i]['Condition'][0])
+    plt.show()
+    plt.close()
+
+condition_list = pd.DataFrame(r.condition_list_bvp, columns =['Section'])
+PPG_Interval_Table = pd.concat([condition_list, PPG_Interval_Table], axis=1)
+
+ppg_time_list = [
+    ppg_epochs_raw[i]["Time_microsec"].iloc[:len(final_ppg_signals[i])]  # safe alignment
+    for i in ppg_epochs_raw
+]
+ppg_time_concat = pd.concat(ppg_time_list, ignore_index=True)
+
+lst = list(final_ppg_signals.values())
+final_ppg_signals_df = pd.concat(lst)  
+
+final_ppg_signals_df["Time_microsec"] = ppg_time_concat.values  # aligned
+final_ppg_signals_df["Time_sec"] = final_ppg_signals_df["Time_microsec"] / 1e6 # new
+
+del(hrv_out)
+del(PPG_Rate_Mean)
+del(PPG_Rate_Mean_df)
+
+with suppress_stdout():
+  gc.collect()
+
+```
+
+Below are a series of metrics for elements of the particpant's heart rate, broken down by segments of the Protocol.
+
+```{r PPG Metrics Table, echo = FALSE, warning=FALSE, message=FALSE,rows.print=15}
+ppg_metrics <-   py$PPG_Interval_Table %>% mutate(ID = row_number()) %>% select(ID, everything())
+paged_table(
+  (ppg_metrics %>%
+   mutate(across(contains("HRV"), as.double)) %>% #Converts matrix columns to doubles
+  mutate(PPG_Rate_Mean = as.double(PPG_Rate_Mean))),
+  options=list(rows.print=15))
+
+```
+
+# Visualization of Metrics by Segment
+
+Below is a plot of the data after some processing. 
+
+```{python data_clean, echo = FALSE, warning=FALSE, message=FALSE, eval = TRUE}
+# ECG_Rate, PPG_Rate, EDA_Phasic
+# final_eda_info.plot(x = ")
+
+fig, axs = plt.subplots(3, 1, figsize=(14, 8), sharex=True)
+
+# Plot EDA Phasic
+axs[0].plot(
+    final_eda_signals_df["Time_sec"],
+    final_eda_signals_df["EDA_Phasic"],
+    label="EDA Phasic",
+    color="#1f77b4",
+    linewidth=1.5
+)
+axs[0].set_ylabel("EDA Phasic (µS)", fontsize=11)
+axs[0].legend(loc="upper right")
+axs[0].grid(True, linestyle='--', linewidth=0.5, alpha=0.6)
+
+# Plot ECG Rate
+axs[1].plot(
+    final_ecg_signals_df["Time_sec"],
+    final_ecg_signals_df["ECG_Rate"],
+    label="ECG Rate",
+    color="#d62728",
+    linewidth=1.5
+)
+axs[1].set_ylabel("ECG Rate (bpm)", fontsize=11)
+axs[1].legend(loc="upper right")
+axs[1].grid(True, linestyle='--', linewidth=0.5, alpha=0.6)
+
+# Plot PPG Rate
+axs[2].plot(
+    final_ppg_signals_df["Time_sec"],
+    final_ppg_signals_df["PPG_Rate"],
+    label="PPG Rate",
+    color="#2ca02c",
+    linewidth=1.5
+)
+axs[2].set_ylabel("PPG Rate (bpm)", fontsize=11)
+axs[2].set_xlabel("Time (seconds)", fontsize=12)
+axs[2].legend(loc="upper right")
+axs[2].grid(True, linestyle='--', linewidth=0.5, alpha=0.6)
+
+fig.suptitle("Physiological Signals Over Time", fontsize=16, fontweight='bold')
+plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+plt.show()
+
+```
+
+```{python delete objects after completed, echo = FALSE, warning=FALSE, message=FALSE, eval = TRUE}
+# lst = list(epochs_raw.values())
+# epochs_raw_df = pd.concat(lst)  
+# 
+# info = {}
+# 
+# data_clean = pd.concat([final_ppg_signals_df,final_eda_signals_df, final_ecg_signals_df], axis=1) # separate the signals
+# # data_clean = pd.concat([final_ppg_signals_df,final_eda_signals_df], axis=1) # separate the signals
+# data_clean['Event'] = epochs_raw_df["Event"].values
+# data_clean['Time_msec'] = epochs_raw_df["Time_msec"].values
+# 
+# 
+# info.update(final_ppg_info)
+# info.update(final_eda_info)
+# info.update(final_ecg_info)
+# 
+# 
+# data_clean.plot(subplots=True, x="Time_msec", y=["ECG_Rate","PPG_Rate", "EDA_Phasic"])
+# plt.show()
+# plt.close()
+
+
+#Delete Python Objects after completed
+del(ECG_Interval_Table)
+del(EDA_Interval_Table)
+del(PPG_Interval_Table)
+del(Next_ECG_Interval_Table)
+del(Next_EDA_Interval_Table)
+del(Next_PPG_Interval_Table)
+del(cardiac_phase)
+del(delineate_info)
+del(delineate_signal)
+del(ecg_cleaned)
+del(ecg_signal)
+del(ppg_signal)
+del(ppg_cleaned)
+del(eda_cleaned)
+del(eda_decomposed)
+del(eda_signal)
+del(events)
+del(final_ecg_info)
+del(final_ecg_signals)
+del(final_ecg_signals_df)
+del(final_eda_info)
+del(final_eda_signals)
+del(final_eda_signals_df)
+del(final_ppg_info)
+del(final_ppg_signals)
+del(final_ppg_signals_df)
+del(i)
+del(info)
+del(instant_peaks)
+del(lst)
+del(peak_signal)
+del(peaks_signal)
+del(quality)
+del(rate)
+del(sampling_rate)
+del(signal)
+del(signals)
+del(cols)
+del(ECG_Quality_Cat)
+del(quality_cat)
+
+with suppress_stdout():
+  gc.collect()
+
+```
+
+# Final Metrics
+
+Below is the final table of metrics, extracted for this participants, within individual segments defined by the PsychoPy program. 
+
+
+```{r metric generation, echo = FALSE, warning=FALSE, message=FALSE, rows.print=15}
+metrics <-  eda_metrics %>%
+  full_join(ecg_metrics) %>%
+  full_join(ppg_metrics, by="ID", suffix = c("_ECG", "_PPG")) %>% # both them have HRV metrics
+  mutate( 
+    RID = RID
+  ) %>%
+   mutate(across(contains("HRV"), as.double)) %>% #Converts matrix columns to doubles
+  mutate(ECG_Rate_Mean = as.double(ECG_Rate_Mean)) %>%
+  mutate(PPG_Rate_Mean = as.double(PPG_Rate_Mean)) %>%
+  select(ID, RID,everything())
+
+filename <- paste0(paths_list$metrics_path,"R",as.character(RID),"_metrics.csv")
+
+write_csv(metrics, file=filename)
+
+paged_table(metrics, options=list(rows.print=15))
+
+```
+
+
+
+# Meta Information
+
+<details>
+
+<summary>
+
+Click to expand!
+
+</summary>
+
+```{r Meta}
+#Meta Data for Session
+
+R.version
+
+sessionInfo();
+
+installed.packages()[names(sessionInfo()$otherPkgs), "Version"]
+
+rm(list=ls()[! ls() %in% c("paths_list","params","R_list","r")])
+
+```
+
+```{python Meta_py}
+session_info.show()
+
+```
+</details>
